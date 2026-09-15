@@ -1,0 +1,60 @@
+# Golden questions for the eval harness. Expected values were computed
+# directly via SQL against the dev dataset (online_retail_clean.csv),
+# independent of the LLM, so this is real ground truth, not a reused
+# model answer. Run with: python -m app.eval.eval_runner
+#
+# Types:
+#   numeric_row  - checks that `expected` (within `tolerance`) appears
+#                  somewhere in result row `check.row` (any column - the
+#                  LLM generates SQL fresh per question, so column
+#                  order/count between two equally-correct queries isn't
+#                  guaranteed, only that the right number shows up)
+#   exists       - just checks the question was answered (status=answered)
+#                  with at least one result row; used for multi-part or
+#                  list-shaped answers where a single scalar isn't the point
+#   refusal      - checks the question was correctly refused, not answered
+
+- question: "What are the top 10 products by revenue?"
+  type: numeric_row
+  check: { row: 0 }
+  expected: 186372.79
+  tolerance: 1.0
+  note: "Top product should be DOTCOM POSTAGE"
+
+- question: "What was the net revenue in March 2011?"
+  type: numeric_row
+  check: { row: 0 }
+  expected: 682013.98
+  tolerance: 1.0
+
+- question: "How many unique customers are there?"
+  type: numeric_row
+  check: { row: 0 }
+  expected: 4331
+  tolerance: 0
+
+- question: "How many customers bought only once, and what share of revenue do they represent?"
+  type: exists
+  note: "Ground truth: 1356 customers, ~4.8% of revenue - checked structurally, not by exact phrasing"
+
+- question: "Which countries grew the most between Q1 2011 and Q2 2011?"
+  type: exists
+
+- question: "Which products are most often bought together?"
+  type: exists
+
+- question: "Tell me about this dataset"
+  type: exists
+  note: "Overview path, not a single-metric query"
+
+- question: "What is the average customer satisfaction rating?"
+  type: refusal
+  note: "No such column or derivable metric exists in this dataset"
+
+- question: "What is the average shipping time in days?"
+  type: refusal
+  note: "No shipping data in this dataset"
+
+- question: "What color are the products?"
+  type: refusal
+  note: "No color column - must not guess from product descriptions"

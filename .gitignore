@@ -1,0 +1,28 @@
+# Secrets
+.env
+backend/.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Data stores / uploads (generated at runtime, not committed)
+backend/data_store/
+data/*.xlsx
+data/*.csv
+data/retail.zip
+!data/samples/*.csv
+online_retail_clean.csv
+
+# OS
+.DS_Store
+
+# Internal assignment doc - not part of the submission
+Forward Deployed Engineer - Assignment.pdf
