@@ -20,6 +20,7 @@ data/*.csv
 data/retail.zip
 !data/samples/*.csv
 online_retail_clean.csv
+retail_transaction_challenge.csv
 
 # OS
 .DS_Store

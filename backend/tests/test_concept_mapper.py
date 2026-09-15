@@ -11,12 +11,12 @@ from app.ingestion.models import ColumnProfile, SchemaProfile
 from app.semantic.concept_mapper import build_concept_map
 
 
-def col(name, kind, distinct_count, row_count, sample_values=None, null_count=0):
+def col(name, kind, distinct_count, row_count, sample_values=None, null_count=0, min_value=None, max_value=None):
     return ColumnProfile(
         name=name, duckdb_type=kind.upper(), kind=kind,
         null_count=null_count, null_fraction=null_count / row_count if row_count else 0.0,
         distinct_count=distinct_count, is_likely_unique=distinct_count >= row_count * 0.98,
-        sample_values=sample_values or [],
+        sample_values=sample_values or [], min_value=min_value, max_value=max_value,
     )
 
 
@@ -235,6 +235,217 @@ async def test_unclaimed_low_cardinality_text_columns_become_dimensions():
     # rather than being silently dropped.
     assert "rider_handle" in dim_cols
     assert "driver_id" in dim_cols
+
+
+DISCOUNTED_RETAIL_COLUMNS = [
+    col("order_ref", "text", 1400, 2625),
+    col("buyer_ref", "text", 300, 2625),
+    col("units_sold", "integer", 10, 2625, min_value=1, max_value=10),
+    col("unit_price", "numeric", 200, 2625, min_value=1.0, max_value=500.0),
+    col("promo_rate", "numeric", 4, 2625, sample_values=[0.0, 0.05, 0.1], min_value=0.0, max_value=0.15),
+    col("purchased_on", "datetime", 300, 2625),
+]
+
+
+@pytest.mark.asyncio
+async def test_line_amount_derivation_applies_discount_rate_when_resolved():
+    """Reproduces a real bug found against an external dataset: a
+    row-level discount/promo rate column was silently ignored because no
+    structural role existed for it, so 'net revenue' was computed as gross
+    (qty * unit_price) instead of qty * unit_price * (1 - rate) - overstating
+    revenue by the full discount amount on every row."""
+    llm = FakeLLMClient(
+        {
+            "event_group_id": role("order_ref"),
+            "entity_id": role("buyer_ref"),
+            "quantity": role("units_sold"),
+            "unit_amount": role("unit_price"),
+            "line_discount_rate": role("promo_rate"),
+            "line_amount": role(None, derive_from_quantity_and_unit_amount=True),
+            "event_time": role("purchased_on"),
+        }
+    )
+    p = profile(DISCOUNTED_RETAIL_COLUMNS, 2625)
+    cmap = await build_concept_map(p, llm, model="fake")
+
+    assert cmap.get("line_discount_rate").expression == '"promo_rate"'
+    line = cmap.get("line_amount")
+    assert line.source == "derived_expression"
+    assert line.expression == '("units_sold" * "unit_price" * (1 - "promo_rate"))'
+
+
+@pytest.mark.asyncio
+async def test_line_amount_derivation_without_discount_rate_stays_gross():
+    """When no discount rate is proposed (or none exists), line_amount must
+    stay a plain qty * unit_amount - the discount factor is additive, never
+    assumed."""
+    llm = FakeLLMClient(
+        {
+            "quantity": role("units_sold"),
+            "unit_amount": role("unit_price"),
+            "line_amount": role(None, derive_from_quantity_and_unit_amount=True),
+        }
+    )
+    p = profile(DISCOUNTED_RETAIL_COLUMNS, 2625)
+    cmap = await build_concept_map(p, llm, model="fake")
+    line = cmap.get("line_amount")
+    assert line.expression == '("units_sold" * "unit_price")'
+    assert cmap.get("line_discount_rate") is None
+
+
+@pytest.mark.asyncio
+async def test_discount_rate_proposal_outside_zero_to_one_range_rejected():
+    """A numeric column outside [0, 1] cannot be a fractional discount rate
+    (e.g. a column of raw discount amounts in dollars, or a percentage
+    stored as 0-100) - the structural check must catch this regardless of
+    what the LLM proposed or how confident it was."""
+    columns = DISCOUNTED_RETAIL_COLUMNS + [
+        col("discount_amount_dollars", "numeric", 50, 2625, min_value=0.0, max_value=120.0)
+    ]
+    llm = FakeLLMClient(
+        {
+            "quantity": role("units_sold"),
+            "unit_amount": role("unit_price"),
+            "line_discount_rate": role("discount_amount_dollars", confidence=0.9),
+            "line_amount": role(None, derive_from_quantity_and_unit_amount=True),
+        }
+    )
+    p = profile(columns, 2625)
+    cmap = await build_concept_map(p, llm, model="fake")
+    assert cmap.get("line_discount_rate") is None
+    assert "outside [0, 1]" in cmap.roles["line_discount_rate"].note
+    line = cmap.get("line_amount")
+    assert line.expression == '("units_sold" * "unit_price")'
+
+
+@pytest.mark.asyncio
+async def test_discount_rate_not_applied_when_line_amount_is_a_direct_column():
+    """If line_amount already comes from a direct total column, we don't
+    know whether that total already reflects the discount - applying the
+    rate again would risk double-discounting, so it must be left alone."""
+    columns = DISCOUNTED_RETAIL_COLUMNS + [
+        col("line_total", "numeric", 2000, 2625, min_value=1.0, max_value=4000.0)
+    ]
+    llm = FakeLLMClient(
+        {
+            "line_discount_rate": role("promo_rate"),
+            "line_amount": role("line_total"),
+        }
+    )
+    p = profile(columns, 2625)
+    cmap = await build_concept_map(p, llm, model="fake")
+    assert cmap.get("line_discount_rate").expression == '"promo_rate"'
+    assert cmap.get("line_amount").expression == '"line_total"'
+
+
+@pytest.mark.asyncio
+async def test_line_amount_derivation_applies_surcharge_rate_when_resolved():
+    """A tax/VAT/markup rate column is the mirror-image case of a discount:
+    it should increase the derived total, not decrease it."""
+    columns = DISCOUNTED_RETAIL_COLUMNS + [
+        col("tax_rate", "numeric", 3, 2625, sample_values=[0.0, 0.07, 0.08], min_value=0.0, max_value=0.08)
+    ]
+    llm = FakeLLMClient(
+        {
+            "quantity": role("units_sold"),
+            "unit_amount": role("unit_price"),
+            "line_surcharge_rate": role("tax_rate"),
+            "line_amount": role(None, derive_from_quantity_and_unit_amount=True),
+        }
+    )
+    p = profile(columns, 2625)
+    cmap = await build_concept_map(p, llm, model="fake")
+    assert cmap.get("line_surcharge_rate").expression == '"tax_rate"'
+    line = cmap.get("line_amount")
+    assert line.source == "derived_expression"
+    assert line.expression == '("units_sold" * "unit_price" * (1 + "tax_rate"))'
+
+
+@pytest.mark.asyncio
+async def test_line_amount_derivation_applies_flat_adjustment_when_resolved():
+    """A flat shipping fee (or flat discount/refund) column adds/subtracts
+    a raw monetary delta rather than scaling the total by a fraction."""
+    columns = DISCOUNTED_RETAIL_COLUMNS + [
+        col("shipping_fee", "numeric", 5, 2625, min_value=0.0, max_value=15.0)
+    ]
+    llm = FakeLLMClient(
+        {
+            "quantity": role("units_sold"),
+            "unit_amount": role("unit_price"),
+            "line_amount_adjustment": role("shipping_fee"),
+            "line_amount": role(None, derive_from_quantity_and_unit_amount=True),
+        }
+    )
+    p = profile(columns, 2625)
+    cmap = await build_concept_map(p, llm, model="fake")
+    assert cmap.get("line_amount_adjustment").expression == '"shipping_fee"'
+    line = cmap.get("line_amount")
+    assert line.source == "derived_expression"
+    assert line.expression == '("units_sold" * "unit_price" + "shipping_fee")'
+
+
+@pytest.mark.asyncio
+async def test_line_amount_derivation_composes_all_three_adjustments_together():
+    """The realistic worst case: a dataset with a discount, a tax, and a
+    flat fee all at once. All three must compose in one expression, applied
+    in a fixed, predictable order (discount, then surcharge, then flat)."""
+    columns = DISCOUNTED_RETAIL_COLUMNS + [
+        col("tax_rate", "numeric", 3, 2625, min_value=0.0, max_value=0.08),
+        col("shipping_fee", "numeric", 5, 2625, min_value=0.0, max_value=15.0),
+    ]
+    llm = FakeLLMClient(
+        {
+            "quantity": role("units_sold"),
+            "unit_amount": role("unit_price"),
+            "line_discount_rate": role("promo_rate"),
+            "line_surcharge_rate": role("tax_rate"),
+            "line_amount_adjustment": role("shipping_fee"),
+            "line_amount": role(None, derive_from_quantity_and_unit_amount=True),
+        }
+    )
+    p = profile(columns, 2625)
+    cmap = await build_concept_map(p, llm, model="fake")
+    line = cmap.get("line_amount")
+    assert line.expression == (
+        '("units_sold" * "unit_price" * (1 - "promo_rate") * (1 + "tax_rate") + "shipping_fee")'
+    )
+
+
+@pytest.mark.asyncio
+async def test_surcharge_rate_proposal_outside_zero_to_one_range_rejected():
+    columns = DISCOUNTED_RETAIL_COLUMNS + [
+        col("markup_multiplier", "numeric", 20, 2625, min_value=1.0, max_value=3.5)
+    ]
+    llm = FakeLLMClient(
+        {
+            "quantity": role("units_sold"),
+            "unit_amount": role("unit_price"),
+            "line_surcharge_rate": role("markup_multiplier", confidence=0.9),
+            "line_amount": role(None, derive_from_quantity_and_unit_amount=True),
+        }
+    )
+    p = profile(columns, 2625)
+    cmap = await build_concept_map(p, llm, model="fake")
+    assert cmap.get("line_surcharge_rate") is None
+    line = cmap.get("line_amount")
+    assert line.expression == '("units_sold" * "unit_price")'
+
+
+@pytest.mark.asyncio
+async def test_flat_adjustment_proposal_with_non_numeric_column_rejected():
+    llm = FakeLLMClient(
+        {
+            "quantity": role("units_sold"),
+            "unit_amount": role("unit_price"),
+            "line_amount_adjustment": role("order_ref", confidence=0.9),  # a text id, not an amount
+            "line_amount": role(None, derive_from_quantity_and_unit_amount=True),
+        }
+    )
+    p = profile(DISCOUNTED_RETAIL_COLUMNS, 2625)
+    cmap = await build_concept_map(p, llm, model="fake")
+    assert cmap.get("line_amount_adjustment") is None
+    line = cmap.get("line_amount")
+    assert line.expression == '("units_sold" * "unit_price")'
 
 
 @pytest.mark.asyncio

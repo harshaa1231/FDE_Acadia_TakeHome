@@ -32,6 +32,9 @@ STRUCTURAL_ROLES: list[str] = [
     "item_label",        # free-text label/description paired with item_id
     "quantity",
     "unit_amount",       # a per-unit monetary value
+    "line_discount_rate",     # a fractional (0-1) discount/promo rate that reduces a row's total
+    "line_surcharge_rate",    # a fractional (0-1) tax/markup rate that increases a row's total
+    "line_amount_adjustment",  # a flat monetary delta (fee, flat discount, refund) on a row
     "line_amount",       # the monetary total for the row (direct or derived)
     "event_time",
 ]

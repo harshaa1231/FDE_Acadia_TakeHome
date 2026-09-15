@@ -43,7 +43,15 @@ built separately from the same structure given to you.
 5. If you can answer with a specific query, respond with ONLY the SQL \
 statement - no explanation before or after it.
 6. Prefer a named metric expression over writing your own aggregation \
-when one already covers what is asked.
+when one already covers what is asked - but a named metric is only \
+complete if it accounts for every relevant column. Before using \
+`net_revenue` or any other monetary metric, check `other_columns`: if one \
+of them looks, from its name or sample values, like it still adjusts a \
+row's monetary total (a rate, percentage, fee, tax, discount, or refund \
+column not already folded into a structural role), do not treat the named \
+metric as complete. Either incorporate that column into your own SQL \
+expression, or if you are not confident how it combines with the total, \
+`REFUSE` rather than present a number that may be silently wrong.
 7. When ranking or identifying a specific entity, customer, or item \
 (e.g. "top customer", "best-selling product", "which driver..."), exclude \
 rows where that identifier is NULL, unless the question is explicitly \

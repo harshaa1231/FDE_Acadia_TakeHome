@@ -67,12 +67,34 @@ procedure...)
 - item_label: a free-text name/description column paired with item_id
 - quantity: a numeric count of units in the row
 - unit_amount: a per-unit monetary value
+- line_discount_rate: a fractional discount/promo/rebate rate (between 0 \
+and 1) that REDUCES a row's monetary total when applied, e.g. a promo \
+rate or discount percentage stored as a fraction. Only propose this if \
+such a column clearly exists - most datasets will not have one.
+- line_surcharge_rate: a fractional tax/markup/service-charge rate \
+(between 0 and 1) that INCREASES a row's monetary total when applied, \
+e.g. a sales tax rate, VAT rate, or markup percentage stored as a \
+fraction. Only propose this if such a column clearly exists, and never \
+propose the same column as line_discount_rate.
+- line_amount_adjustment: a flat monetary amount added to or subtracted \
+from a row's total that is NOT already unit_amount/quantity/a rate - \
+e.g. a shipping fee, flat service charge, flat discount amount, or \
+refund amount expressed in the same currency as the transaction \
+(positive values increase the total, negative values decrease it). Only \
+propose this if such a column clearly exists.
 - line_amount: the monetary total for the row. If there is no direct \
-total column, set derive_from_quantity_and_unit_amount to true only if \
+total column, set derive_from_quantity_and_unit_amount to true whenever \
 BOTH a quantity and a unit_amount clearly exist and multiplying them \
-yields the row's total. If there is a single monetary column and no \
-separate quantity concept, propose that column directly as line_amount \
-instead (it already represents the row's total) rather than deriving.
+yields the row's PRE-adjustment subtotal - do this even if you also \
+proposed a line_discount_rate, line_surcharge_rate, or \
+line_amount_adjustment above; you do not need to compute the final \
+total yourself, the system automatically applies whichever of those \
+adjustment roles you resolved on top of quantity * unit_amount. Only \
+leave derive_from_quantity_and_unit_amount false if quantity or \
+unit_amount themselves are missing or don't multiply to a meaningful \
+subtotal. If there is a single monetary column and no separate quantity \
+concept, propose that column directly as line_amount instead (it \
+already represents the row's total) rather than deriving.
 - event_time: the timestamp of the transaction
 
 Respond with strict JSON only, exactly matching this shape (no other \
@@ -84,6 +106,9 @@ text, no markdown fences):
   "item_label": {"column": ..., "confidence": ..., "reasoning": ...},
   "quantity": {"column": ..., "confidence": ..., "reasoning": ...},
   "unit_amount": {"column": ..., "confidence": ..., "reasoning": ...},
+  "line_discount_rate": {"column": "<exact column name or null>", "confidence": ..., "reasoning": ...},
+  "line_surcharge_rate": {"column": "<exact column name or null>", "confidence": ..., "reasoning": ...},
+  "line_amount_adjustment": {"column": "<exact column name or null>", "confidence": ..., "reasoning": ...},
   "line_amount": {"column": "<exact column name or null>", "derive_from_quantity_and_unit_amount": true|false, "confidence": 0.0-1.0, "reasoning": "<one sentence>"},
   "event_time": {"column": ..., "confidence": ..., "reasoning": ...}
 }
@@ -110,6 +135,9 @@ class _LLMRoleResponse(BaseModel):
     item_label: _RoleProposal = Field(default_factory=_RoleProposal)
     quantity: _RoleProposal = Field(default_factory=_RoleProposal)
     unit_amount: _RoleProposal = Field(default_factory=_RoleProposal)
+    line_discount_rate: _RoleProposal = Field(default_factory=_RoleProposal)
+    line_surcharge_rate: _RoleProposal = Field(default_factory=_RoleProposal)
+    line_amount_adjustment: _RoleProposal = Field(default_factory=_RoleProposal)
     line_amount: _LineAmountProposal = Field(default_factory=_LineAmountProposal)
     event_time: _RoleProposal = Field(default_factory=_RoleProposal)
 
@@ -192,6 +220,75 @@ def _validate_simple_role(
     )
 
 
+_RATE_TOLERANCE = 1e-9
+
+
+def _validate_rate_role(
+    role: str, proposal: _RoleProposal, profile: SchemaProfile, claimed: set[str]
+) -> ResolvedRole:
+    """Shared validator for any fractional (0-1) per-line rate role -
+    line_discount_rate and line_surcharge_rate both reduce to the same
+    structural check: numeric, and every actual value in the file falls
+    within [0, 1]. Whether the rate increases or decreases the total is a
+    fixed property of which role it was proposed for, decided by the LLM
+    from the column's name/samples - never guessed from the numbers alone."""
+    col = _find_column(profile, proposal.column)
+    if col is None:
+        reason = "no column proposed" if not proposal.column else f"proposed column '{proposal.column}' not found in schema"
+        return ResolvedRole(role=role, source="not_found", confidence=0.0, note=reason)
+    if col.name in claimed:
+        return ResolvedRole(
+            role=role, source="not_found", confidence=0.0,
+            note=f"proposed column '{col.name}' was already claimed by another role",
+        )
+    if col.kind != "numeric":
+        return ResolvedRole(
+            role=role, source="not_found", confidence=0.0,
+            note=f"proposed column '{col.name}' has kind '{col.kind}', not a fractional rate",
+        )
+    lo, hi = col.min_value, col.max_value
+    if lo is None or hi is None or lo < -_RATE_TOLERANCE or hi > 1 + _RATE_TOLERANCE:
+        return ResolvedRole(
+            role=role, source="not_found", confidence=0.0,
+            note=f"proposed column '{col.name}' has values outside [0, 1] ({lo}..{hi}), not a fractional rate",
+        )
+    confidence = max(0.0, min(1.0, proposal.confidence))
+    claimed.add(col.name)
+    return ResolvedRole(
+        role=role, source="direct_column", expression=f'"{col.name}"',
+        confidence=confidence, note=f"LLM-proposed: {proposal.reasoning}"[:300],
+    )
+
+
+def _validate_flat_adjustment(
+    proposal: _RoleProposal, profile: SchemaProfile, claimed: set[str]
+) -> ResolvedRole:
+    """A flat per-line monetary delta (fee, flat discount, refund) - any
+    sign is valid (it can increase or decrease the total), so the only
+    structural check is numeric type and that it isn't already claimed by
+    another role."""
+    col = _find_column(profile, proposal.column)
+    if col is None:
+        reason = "no column proposed" if not proposal.column else f"proposed column '{proposal.column}' not found in schema"
+        return ResolvedRole(role="line_amount_adjustment", source="not_found", confidence=0.0, note=reason)
+    if col.name in claimed:
+        return ResolvedRole(
+            role="line_amount_adjustment", source="not_found", confidence=0.0,
+            note=f"proposed column '{col.name}' was already claimed by another role",
+        )
+    if col.kind not in _AMOUNT_LIKE_KINDS:
+        return ResolvedRole(
+            role="line_amount_adjustment", source="not_found", confidence=0.0,
+            note=f"proposed column '{col.name}' has kind '{col.kind}', not a monetary amount",
+        )
+    confidence = max(0.0, min(1.0, proposal.confidence))
+    claimed.add(col.name)
+    return ResolvedRole(
+        role="line_amount_adjustment", source="direct_column", expression=f'"{col.name}"',
+        confidence=confidence, note=f"LLM-proposed: {proposal.reasoning}"[:300],
+    )
+
+
 def _validate_line_amount(
     proposal: _LineAmountProposal, profile: SchemaProfile, claimed: set[str], roles: dict[str, ResolvedRole]
 ) -> ResolvedRole:
@@ -221,11 +318,34 @@ def _validate_line_amount(
     if proposal.derive_from_quantity_and_unit_amount and roles.get("quantity") and roles.get("unit_amount"):
         qty, unit = roles["quantity"], roles["unit_amount"]
         if qty.source != "not_found" and unit.source != "not_found":
+            expression = f"{qty.expression} * {unit.expression}"
+            applied: list[str] = []
+
+            discount = roles.get("line_discount_rate")
+            if discount and discount.source != "not_found":
+                expression = f"{expression} * (1 - {discount.expression})"
+                applied.append(f"discounted by {discount.expression}")
+
+            surcharge = roles.get("line_surcharge_rate")
+            if surcharge and surcharge.source != "not_found":
+                expression = f"{expression} * (1 + {surcharge.expression})"
+                applied.append(f"surcharged by {surcharge.expression}")
+
+            adjustment = roles.get("line_amount_adjustment")
+            if adjustment and adjustment.source != "not_found":
+                expression = f"{expression} + {adjustment.expression}"
+                applied.append(f"adjusted by {adjustment.expression}")
+
+            note = "LLM-proposed derivation"
+            if applied:
+                note += ", " + ", ".join(applied)
+            note = f"{note}: {proposal.reasoning}"[:300]
+
             return ResolvedRole(
                 role="line_amount", source="derived_expression",
-                expression=f"({qty.expression} * {unit.expression})",
+                expression=f"({expression})",
                 confidence=max(0.0, min(1.0, proposal.confidence)),
-                note=f"LLM-proposed derivation: {proposal.reasoning}"[:300],
+                note=note,
             )
 
     return ResolvedRole(
@@ -285,6 +405,15 @@ async def build_concept_map(profile: SchemaProfile, llm: LLMClient, model: str) 
                 else ("datetime",)
             )
             roles[role] = _validate_simple_role(role, getattr(proposal, field_name), profile, claimed, allowed)
+        roles["line_discount_rate"] = _validate_rate_role(
+            "line_discount_rate", proposal.line_discount_rate, profile, claimed
+        )
+        roles["line_surcharge_rate"] = _validate_rate_role(
+            "line_surcharge_rate", proposal.line_surcharge_rate, profile, claimed
+        )
+        roles["line_amount_adjustment"] = _validate_flat_adjustment(
+            proposal.line_amount_adjustment, profile, claimed
+        )
         roles["line_amount"] = _validate_line_amount(proposal.line_amount, profile, claimed, roles)
     except Exception as e:
         logger.warning("LLM role proposal failed for dataset %s (%s); using structural fallback", profile.dataset_id, e)
