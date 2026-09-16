@@ -8,6 +8,25 @@ Slack thread.
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the architecture, the biggest decisions,
 and where the schema-inference mechanism breaks.
 
+## Demo
+
+**Primary flow** — upload the dev dataset (UCI Online Retail, 511k rows, 25 columns),
+see the resolved schema, ask two of the brief's example questions, inspect the
+generated SQL:
+
+![Primary flow demo](docs/media/demo-primary-flow.gif)
+
+**A second, different CSV** — a real, previously-unseen Kaggle dataset (Brazilian
+e-commerce order items) with a completely different schema: no product names, a
+shipping-fee column instead of a discount, no explicit quantity column. Same app,
+zero code changes, a different resolved concept map:
+
+![Second CSV demo](docs/media/demo-second-csv.gif)
+
+Both recorded after the questions were already known to answer correctly, so the
+clips stay short — see [`docs/DESIGN.md`](docs/DESIGN.md) for what each schema
+actually resolved to and why.
+
 ## Quickstart (one command)
 
 ```bash
@@ -103,7 +122,7 @@ auto-generated OpenAPI UI).
 ```bash
 cd backend
 source .venv/bin/activate
-pytest                 # 28 tests, deterministic, no network calls, ~0.7s
+pytest                 # 47 tests, deterministic, no network calls, ~1s
 ruff check app tests   # lint
 ```
 

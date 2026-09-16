@@ -8,7 +8,7 @@ never reach the ConceptMap - that's the guardrail these tests prove.
 import pytest
 
 from app.ingestion.models import ColumnProfile, SchemaProfile
-from app.semantic.concept_mapper import build_concept_map
+from app.semantic.concept_mapper import _roles_array_to_dict, build_concept_map
 
 
 def col(name, kind, distinct_count, row_count, sample_values=None, null_count=0, min_value=None, max_value=None):
@@ -43,6 +43,46 @@ def role(column=None, confidence=0.9, reasoning="test", **extra):
     return d
 
 
+def test_roles_array_wire_format_is_unwrapped_to_a_flat_dict():
+    """The real system prompt now asks the LLM for {"roles": [{"role": "x",
+    ...}, ...]} instead of a flat {"x": {...}} object - reproduced live
+    against a 25-column real dataset, the flat-object shape reliably made
+    the fast model emit malformed JSON (a stray '{' before each subsequent
+    key) because an object with many identically-shaped keys reads to the
+    model like it wants to be a list. This is the contract translation
+    layer between that wire format and the rest of the module."""
+    raw = {
+        "roles": [
+            {"role": "event_group_id", "column": "invoice_no", "confidence": 0.9, "reasoning": "groups rows"},
+            {
+                "role": "line_amount", "column": None, "derive_from_quantity_and_unit_amount": True,
+                "confidence": 0.8, "reasoning": "qty*price",
+            },
+        ]
+    }
+    out = _roles_array_to_dict(raw)
+    assert out == {
+        "event_group_id": {"column": "invoice_no", "confidence": 0.9, "reasoning": "groups rows"},
+        "line_amount": {
+            "column": None, "derive_from_quantity_and_unit_amount": True,
+            "confidence": 0.8, "reasoning": "qty*price",
+        },
+    }
+
+
+def test_roles_array_wire_format_ignores_entries_with_no_role_name():
+    raw = {"roles": [{"column": "foo", "confidence": 0.5, "reasoning": "no role key"}]}
+    assert _roles_array_to_dict(raw) == {}
+
+
+def test_flat_dict_wire_format_still_passes_through_unchanged():
+    """Every existing test fixture, and the structural fallback path, builds
+    the old flat {"event_group_id": {...}, ...} shape directly - it must
+    keep working exactly as before."""
+    raw = {"event_group_id": {"column": "invoice_no", "confidence": 0.9, "reasoning": "x"}}
+    assert _roles_array_to_dict(raw) == raw
+
+
 RIDESHARE_COLUMNS = [
     col("trip_ref", "text", 2900, 3000),
     col("rider_handle", "text", 60, 3000, sample_values=["rider_21@mail.com"]),
@@ -52,6 +92,33 @@ RIDESHARE_COLUMNS = [
     col("tip_amount", "numeric", 6, 3000),
     col("requested_at", "datetime", 2990, 3000),
 ]
+
+
+@pytest.mark.asyncio
+async def test_build_concept_map_end_to_end_with_real_array_wire_format():
+    """Unlike every other test in this file (which stub the LLM with the
+    internal flat-dict shape for convenience), this one uses the actual
+    {"roles": [...]} wire format the real system prompt asks for, proving
+    the full pipeline - not just the transform function in isolation -
+    correctly consumes it."""
+    llm = FakeLLMClient(
+        {
+            "roles": [
+                {"role": "event_group_id", "column": "trip_ref", "confidence": 0.9, "reasoning": "groups rows"},
+                {"role": "entity_id", "column": "rider_handle", "confidence": 0.9, "reasoning": "the rider"},
+                {"role": "unit_amount", "column": "fare_amount", "confidence": 0.9, "reasoning": "per-fare price"},
+                {
+                    "role": "line_amount", "column": "fare_amount", "confidence": 0.9,
+                    "derive_from_quantity_and_unit_amount": False, "reasoning": "same column",
+                },
+            ]
+        }
+    )
+    p = profile(RIDESHARE_COLUMNS, 3000)
+    cmap = await build_concept_map(p, llm, model="fake")
+    assert cmap.get("event_group_id").expression == '"trip_ref"'
+    assert cmap.get("entity_id").expression == '"rider_handle"'
+    assert cmap.get("line_amount").expression == '"fare_amount"'
 
 
 @pytest.mark.asyncio
@@ -446,6 +513,44 @@ async def test_flat_adjustment_proposal_with_non_numeric_column_rejected():
     assert cmap.get("line_amount_adjustment") is None
     line = cmap.get("line_amount")
     assert line.expression == '("units_sold" * "unit_price")'
+
+
+@pytest.mark.asyncio
+async def test_flat_adjustment_applied_when_line_amount_aliases_unit_amount():
+    """Reproduces a real bug found against an external dataset (Olist order
+    items - no explicit quantity column, so unit_amount ("price") aliases
+    directly as line_amount with an implicit qty=1). A resolved
+    line_amount_adjustment (a per-item "freight_value" shipping fee) must
+    still be folded in here exactly as it would be in the fully-derived
+    quantity * unit_amount case - it was previously silently dropped
+    because only that other branch composed adjustments."""
+    llm = FakeLLMClient(
+        {
+            "unit_amount": role("fare_amount"),
+            "line_amount_adjustment": role("booking_fee"),
+            "line_amount": role("fare_amount"),  # same column as unit_amount
+        }
+    )
+    columns = RIDESHARE_COLUMNS + [col("booking_fee", "numeric", 4, 3000, min_value=0.0, max_value=5.0)]
+    p = profile(columns, 3000)
+    cmap = await build_concept_map(p, llm, model="fake")
+    line = cmap.get("line_amount")
+    assert line.source == "derived_expression"
+    assert line.expression == '("fare_amount" + "booking_fee")'
+
+
+@pytest.mark.asyncio
+async def test_line_amount_aliases_unit_amount_unchanged_without_adjustments():
+    """When no adjustment role resolves, the aliasing case must stay a
+    plain direct-column reference (not wrapped in redundant parens/math) -
+    no behavior change for every dataset that looked like this before
+    adjustment roles existed."""
+    llm = FakeLLMClient({"unit_amount": role("fare_amount"), "line_amount": role("fare_amount")})
+    p = profile(RIDESHARE_COLUMNS, 3000)
+    cmap = await build_concept_map(p, llm, model="fake")
+    line = cmap.get("line_amount")
+    assert line.source == "direct_column"
+    assert line.expression == '"fare_amount"'
 
 
 @pytest.mark.asyncio

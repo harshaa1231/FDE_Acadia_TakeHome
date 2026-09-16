@@ -97,20 +97,27 @@ concept, propose that column directly as line_amount instead (it \
 already represents the row's total) rather than deriving.
 - event_time: the timestamp of the transaction
 
-Respond with strict JSON only, exactly matching this shape (no other \
-text, no markdown fences):
+Respond with strict JSON only (no markdown fences, no other text): a single \
+object with one key, "roles", holding a JSON array with exactly one entry \
+per role listed above, each shaped \
+{"role": "<role name>", "column": "<exact column name or null>", \
+"confidence": 0.0-1.0, "reasoning": "<one sentence>"} - except the \
+line_amount entry, which also includes \
+"derive_from_quantity_and_unit_amount": true|false. Example shape:
 {
-  "event_group_id": {"column": "<exact column name or null>", "confidence": 0.0-1.0, "reasoning": "<one sentence>"},
-  "entity_id": {"column": ..., "confidence": ..., "reasoning": ...},
-  "item_id": {"column": ..., "confidence": ..., "reasoning": ...},
-  "item_label": {"column": ..., "confidence": ..., "reasoning": ...},
-  "quantity": {"column": ..., "confidence": ..., "reasoning": ...},
-  "unit_amount": {"column": ..., "confidence": ..., "reasoning": ...},
-  "line_discount_rate": {"column": "<exact column name or null>", "confidence": ..., "reasoning": ...},
-  "line_surcharge_rate": {"column": "<exact column name or null>", "confidence": ..., "reasoning": ...},
-  "line_amount_adjustment": {"column": "<exact column name or null>", "confidence": ..., "reasoning": ...},
-  "line_amount": {"column": "<exact column name or null>", "derive_from_quantity_and_unit_amount": true|false, "confidence": 0.0-1.0, "reasoning": "<one sentence>"},
-  "event_time": {"column": ..., "confidence": ..., "reasoning": ...}
+  "roles": [
+    {"role": "event_group_id", "column": "<exact column name or null>", "confidence": 0.0-1.0, "reasoning": "<one sentence>"},
+    {"role": "entity_id", "column": ..., "confidence": ..., "reasoning": ...},
+    {"role": "item_id", "column": ..., "confidence": ..., "reasoning": ...},
+    {"role": "item_label", "column": ..., "confidence": ..., "reasoning": ...},
+    {"role": "quantity", "column": ..., "confidence": ..., "reasoning": ...},
+    {"role": "unit_amount", "column": ..., "confidence": ..., "reasoning": ...},
+    {"role": "line_discount_rate", "column": ..., "confidence": ..., "reasoning": ...},
+    {"role": "line_surcharge_rate", "column": ..., "confidence": ..., "reasoning": ...},
+    {"role": "line_amount_adjustment", "column": ..., "confidence": ..., "reasoning": ...},
+    {"role": "line_amount", "column": ..., "derive_from_quantity_and_unit_amount": true|false, "confidence": ..., "reasoning": ...},
+    {"role": "event_time", "column": ..., "confidence": ..., "reasoning": ...}
+  ]
 }
 
 Column names in your response must be copied exactly as given in the \
@@ -140,6 +147,36 @@ class _LLMRoleResponse(BaseModel):
     line_amount_adjustment: _RoleProposal = Field(default_factory=_RoleProposal)
     line_amount: _LineAmountProposal = Field(default_factory=_LineAmountProposal)
     event_time: _RoleProposal = Field(default_factory=_RoleProposal)
+
+
+def _roles_array_to_dict(raw: dict) -> dict:
+    """Converts the wire format {"roles": [{"role": "x", ...}, ...]} into
+    the {"x": {...}, ...} shape _LLMRoleResponse expects. The array shape
+    is what we actually ask the model for - see the system prompt's
+    docstring note above for why: an object with many identically-shaped
+    keys (one per structural role) turned out to reliably produce
+    malformed JSON from the fast model on wider schemas (a stray '{'
+    before each subsequent key, as if the model wanted to emit a list),
+    reproduced consistently against a real 25-column file. Asking for what
+    the model already wants to produce - a JSON array of similarly-shaped
+    items - removed the failure entirely in repeated live testing.
+
+    Accepts the flat {"event_group_id": {...}, ...} shape unchanged too
+    (what every test fixture and fallback path in this module already
+    builds) - only a top-level "roles" array is unwrapped."""
+    if not isinstance(raw, dict):
+        return {}
+    if "roles" not in raw:
+        return raw
+    out: dict = {}
+    for item in raw.get("roles") or []:
+        if not isinstance(item, dict):
+            continue
+        role_name = item.get("role")
+        if not role_name:
+            continue
+        out[role_name] = {k: v for k, v in item.items() if k != "role"}
+    return out
 
 
 def _column_evidence(profile: SchemaProfile) -> list[dict]:
@@ -172,7 +209,7 @@ async def _propose_roles(profile: SchemaProfile, llm: LLMClient, model: str) -> 
     for attempt in range(2):
         try:
             raw = await llm.complete_json(_SYSTEM_PROMPT, user_prompt, model=model)
-            return _LLMRoleResponse.model_validate(raw)
+            return _LLMRoleResponse.model_validate(_roles_array_to_dict(raw))
         except Exception as e:
             last_error = e
             logger.warning(
@@ -289,6 +326,36 @@ def _validate_flat_adjustment(
     )
 
 
+def _compose_adjustments(base_expression: str, roles: dict[str, ResolvedRole]) -> tuple[str, list[str]]:
+    """Folds any resolved discount/surcharge/flat-adjustment roles on top of
+    a base line-total expression, in a fixed order (discount, then
+    surcharge, then flat). Shared by every way line_amount can be
+    established without a direct total column of its own - a fully derived
+    quantity * unit_amount subtotal, or unit_amount standing in for the
+    total when quantity is implicitly 1 - since in both cases we're
+    constructing the total ourselves and any adjustment we've already
+    validated applies just as legitimately either way."""
+    expression = base_expression
+    applied: list[str] = []
+
+    discount = roles.get("line_discount_rate")
+    if discount and discount.source != "not_found":
+        expression = f"{expression} * (1 - {discount.expression})"
+        applied.append(f"discounted by {discount.expression}")
+
+    surcharge = roles.get("line_surcharge_rate")
+    if surcharge and surcharge.source != "not_found":
+        expression = f"{expression} * (1 + {surcharge.expression})"
+        applied.append(f"surcharged by {surcharge.expression}")
+
+    adjustment = roles.get("line_amount_adjustment")
+    if adjustment and adjustment.source != "not_found":
+        expression = f"{expression} + {adjustment.expression}"
+        applied.append(f"adjusted by {adjustment.expression}")
+
+    return expression, applied
+
+
 def _validate_line_amount(
     proposal: _LineAmountProposal, profile: SchemaProfile, claimed: set[str], roles: dict[str, ResolvedRole]
 ) -> ResolvedRole:
@@ -302,13 +369,17 @@ def _validate_line_amount(
         proposal.column and unit_role and unit_role.source == "direct_column"
         and unit_role.expression == f'"{proposal.column}"'
     ):
+        expression, applied = _compose_adjustments(unit_role.expression, roles)
+        note = "same column as unit_amount, treated as the line total (no separate quantity concept)"
+        if applied:
+            note += ", " + ", ".join(applied)
+        note = f"{note}: {proposal.reasoning}"[:300]
         return ResolvedRole(
-            role="line_amount", source="direct_column", expression=unit_role.expression,
+            role="line_amount",
+            source="direct_column" if not applied else "derived_expression",
+            expression=expression if not applied else f"({expression})",
             confidence=max(0.0, min(1.0, proposal.confidence)),
-            note=(
-                f"same column as unit_amount, treated as the line total "
-                f"(no separate quantity concept): {proposal.reasoning}"
-            )[:300],
+            note=note,
         )
 
     direct = _validate_simple_role("line_amount", proposal, profile, claimed, _AMOUNT_LIKE_KINDS)
@@ -318,24 +389,7 @@ def _validate_line_amount(
     if proposal.derive_from_quantity_and_unit_amount and roles.get("quantity") and roles.get("unit_amount"):
         qty, unit = roles["quantity"], roles["unit_amount"]
         if qty.source != "not_found" and unit.source != "not_found":
-            expression = f"{qty.expression} * {unit.expression}"
-            applied: list[str] = []
-
-            discount = roles.get("line_discount_rate")
-            if discount and discount.source != "not_found":
-                expression = f"{expression} * (1 - {discount.expression})"
-                applied.append(f"discounted by {discount.expression}")
-
-            surcharge = roles.get("line_surcharge_rate")
-            if surcharge and surcharge.source != "not_found":
-                expression = f"{expression} * (1 + {surcharge.expression})"
-                applied.append(f"surcharged by {surcharge.expression}")
-
-            adjustment = roles.get("line_amount_adjustment")
-            if adjustment and adjustment.source != "not_found":
-                expression = f"{expression} + {adjustment.expression}"
-                applied.append(f"adjusted by {adjustment.expression}")
-
+            expression, applied = _compose_adjustments(f"{qty.expression} * {unit.expression}", roles)
             note = "LLM-proposed derivation"
             if applied:
                 note += ", " + ", ".join(applied)
