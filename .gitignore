@@ -25,5 +25,8 @@ retail_transaction_challenge.csv
 # OS
 .DS_Store
 
+# Local tool config (not project content)
+.claude/
+
 # Internal assignment doc - not part of the submission
 Forward Deployed Engineer - Assignment.pdf
