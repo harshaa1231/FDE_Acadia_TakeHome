@@ -9,9 +9,38 @@ function Spinner({ muted }) {
   return <span className={`spinner${muted ? " spinner-muted" : ""}`} aria-hidden="true" />;
 }
 
-function formatCell(v) {
+function CopyButton({ text }) {
+  const [copied, setCopied] = useState(false);
+
+  async function handleCopy(e) {
+    e.preventDefault(); // don't toggle the parent <details>
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // Clipboard API can be unavailable (insecure context, permissions);
+      // fail silently rather than surface an error for a copy convenience.
+      return;
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  }
+
+  return (
+    <button type="button" className="copy-button" onClick={handleCopy}>
+      {copied ? "Copied" : "Copy"}
+    </button>
+  );
+}
+
+function formatCell(v, format) {
   if (v === null || v === undefined) return "—";
   if (typeof v === "number") {
+    if (format === "currency") {
+      return v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+    if (format === "integer") {
+      return v.toLocaleString(undefined, { maximumFractionDigits: 0 });
+    }
     return v.toLocaleString(undefined, { maximumFractionDigits: 2 });
   }
   return String(v);
@@ -97,6 +126,55 @@ function UploadPanel({ onDatasetReady }) {
         </div>
       )}
     </section>
+  );
+}
+
+function ResultTable({ answer }) {
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            {answer.columns.map((c) => (
+              <th key={c}>
+                {c}
+                {answer.column_formats?.[c] === "currency" && (
+                  <span className="col-format-hint" title="Monetary value (currency unspecified in the source file)"> ¤</span>
+                )}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {answer.rows.slice(0, 20).map((row, i) => (
+            <tr key={i}>
+              {row.map((v, j) => {
+                const format = answer.column_formats?.[answer.columns[j]];
+                return (
+                  <td key={j} className={typeof v === "number" ? "cell-number" : undefined}>
+                    {formatCell(v, format)}
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function UsageNote({ usage }) {
+  if (!usage) return null;
+  const cost =
+    usage.estimated_cost_usd !== undefined
+      ? ` · ~$${usage.estimated_cost_usd.toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 4 })}`
+      : "";
+  return (
+    <p className="usage-note">
+      {usage.total_tokens.toLocaleString()} tokens · {usage.llm_calls} LLM call{usage.llm_calls === 1 ? "" : "s"}
+      {cost}
+    </p>
   );
 }
 
@@ -195,6 +273,7 @@ function QuestionPanel({ dataset }) {
         <div className="answer-box refused">
           <div className="answer-kicker">Refused</div>
           <p className="answer-text">{answer.reason}</p>
+          <UsageNote usage={answer.usage} />
           {jobId && <TracePanel jobId={jobId} />}
         </div>
       )}
@@ -203,35 +282,29 @@ function QuestionPanel({ dataset }) {
         <div className="answer-box">
           <div className="answer-kicker">Answer</div>
           <p className="answer-text">{answer.answer}</p>
+
+          {answer.rows.length > 1 ? (
+            <>
+              <div className="summary-label">Result rows ({answer.rows.length})</div>
+              <ResultTable answer={answer} />
+            </>
+          ) : (
+            answer.rows.length === 1 && (
+              <details>
+                <summary>Result row</summary>
+                <ResultTable answer={answer} />
+              </details>
+            )
+          )}
+
           <details>
             <summary>Generated SQL</summary>
-            <pre>{answer.sql}</pre>
-          </details>
-          <details>
-            <summary>Result rows ({answer.rows.length})</summary>
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    {answer.columns.map((c) => (
-                      <th key={c}>{c}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {answer.rows.slice(0, 20).map((row, i) => (
-                    <tr key={i}>
-                      {row.map((v, j) => (
-                        <td key={j} className={typeof v === "number" ? "cell-number" : undefined}>
-                          {formatCell(v)}
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+            <div className="code-block">
+              <pre>{answer.sql}</pre>
+              <CopyButton text={answer.sql} />
             </div>
           </details>
+          <UsageNote usage={answer.usage} />
           {jobId && <TracePanel jobId={jobId} />}
         </div>
       )}

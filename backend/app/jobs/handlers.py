@@ -18,6 +18,7 @@ from app.jobs.models import Job
 from app.jobs.trace_store import get_trace_store
 from app.nlq.answer_synth import synthesize_answer
 from app.nlq.answerability_gate import dataset_has_minimal_structure
+from app.nlq.column_formats import infer_column_formats
 from app.nlq.llm_client import get_llm_client
 from app.nlq.prompt_builder import SYSTEM_PROMPT, build_retry_prompt, build_sql_prompt
 from app.nlq.sql_guardrails import SqlGuardrailError, validate_and_finalize_sql
@@ -63,6 +64,7 @@ async def ingest_handler(job: Job) -> dict:
             os.remove(csv_path)  # the data now lives in the DuckDB file; the raw upload is redundant
 
     resolved_roles = [name for name in concept_map.roles if concept_map.has(name)]
+    usage = getattr(llm, "usage", None)
     return {
         "dataset_id": dataset_id,
         "row_count": result.row_count,
@@ -70,6 +72,7 @@ async def ingest_handler(job: Job) -> dict:
         "column_count": len(profile.columns),
         "resolved_roles": resolved_roles,
         "dimensions": [d.column for d in concept_map.dimensions],
+        "usage": usage.to_dict() if usage else None,
     }
 
 
@@ -134,6 +137,11 @@ async def _generate_and_validate(
 
     trace.append_stage(job_id, f"execution_succeeded_{attempt}", {"sql": final_sql, "row_count": len(rows)})
     return {"status": "ok", "sql": final_sql, "columns": columns, "rows": rows}
+
+
+def _usage_dict(llm) -> dict | None:
+    usage = getattr(llm, "usage", None)
+    return usage.to_dict() if usage else None
 
 
 def _dataset_overview_facts(con, dataset, cmap, metrics: list) -> list[tuple[str, object]]:
@@ -217,10 +225,12 @@ async def question_handler(job: Job) -> dict:
             if attempt["status"] == "error":
                 reason = f"Could not produce valid SQL for this question: {attempt['error']}"
                 trace.append_stage(job.id, "refused_after_retry", {"reason": reason})
-                return {"status": "refused", "reason": reason}
+                trace.append_stage(job.id, "usage", _usage_dict(llm) or {})
+                return {"status": "refused", "reason": reason, "usage": _usage_dict(llm)}
 
         if attempt["status"] == "refused":
-            return {"status": "refused", "reason": attempt["reason"]}
+            trace.append_stage(job.id, "usage", _usage_dict(llm) or {})
+            return {"status": "refused", "reason": attempt["reason"], "usage": _usage_dict(llm)}
 
         if attempt["status"] == "overview":
             facts = _dataset_overview_facts(con, dataset, cmap, metrics)
@@ -230,12 +240,18 @@ async def question_handler(job: Job) -> dict:
             rows = [[k, v] for k, v in facts]
             answer = await synthesize_answer(llm, settings.fast_model, question, sql_note, columns, rows)
             trace.append_stage(job.id, "answer_synthesized", {"answer": answer})
-            return {"status": "answered", "answer": answer, "sql": sql_note, "columns": columns, "rows": rows}
+            trace.append_stage(job.id, "usage", _usage_dict(llm) or {})
+            return {
+                "status": "answered", "answer": answer, "sql": sql_note, "columns": columns, "rows": rows,
+                "usage": _usage_dict(llm),
+            }
 
         answer = await synthesize_answer(
             llm, settings.fast_model, question, attempt["sql"], attempt["columns"], attempt["rows"]
         )
         trace.append_stage(job.id, "answer_synthesized", {"answer": answer})
+        column_formats = infer_column_formats(attempt["sql"], attempt["columns"], cmap)
+        trace.append_stage(job.id, "usage", _usage_dict(llm) or {})
 
         return {
             "status": "answered",
@@ -243,6 +259,8 @@ async def question_handler(job: Job) -> dict:
             "sql": attempt["sql"],
             "columns": attempt["columns"],
             "rows": attempt["rows"][: settings.max_result_rows],
+            "column_formats": column_formats,
+            "usage": _usage_dict(llm),
         }
     finally:
         con.close()

@@ -73,6 +73,8 @@ All config is environment variables, set in `backend/.env` (copy from `.env.exam
 | `MAX_UPLOAD_MB` | `200` | Upload size cap |
 | `MAX_RESULT_ROWS` | `500` | Row cap injected into every generated SQL query |
 | `JOB_WORKER_CONCURRENCY` | `4` | Bounded async worker pool size |
+| `SQL_MODEL_COST_PER_1K_TOKENS` | `0.0` | Optional — set to your actual negotiated $/1k-token rate for `SQL_MODEL` to get a cost estimate in each job's `usage`; left at 0 (omitted from the response) rather than guessing a price |
+| `FAST_MODEL_COST_PER_1K_TOKENS` | `0.0` | Same, for `FAST_MODEL` |
 
 The frontend reads `VITE_API_BASE_URL` (see `frontend/.env.example`), defaulting to
 `http://localhost:8000`.
@@ -122,7 +124,7 @@ auto-generated OpenAPI UI).
 ```bash
 cd backend
 source .venv/bin/activate
-pytest                 # 47 tests, deterministic, no network calls, ~1s
+pytest                 # 74 tests, deterministic, no network calls, ~1s
 ruff check app tests   # lint
 ```
 
@@ -158,11 +160,13 @@ failure.
   Costs: doesn't survive a process restart mid-job, doesn't scale past one process.
   Documented as the first thing to swap in `docs/DESIGN.md` if this needed to run at
   real scale.
-- **Caching, follow-up questions, charts, cost tracking, LLM tracing beyond the
-  built-in trace store** — all in the brief's Optional list, skipped per its own
-  instruction that skipping costs nothing. Prioritized instead: making the required
-  core (schema inference on a genuinely unfamiliar file, async jobs, guardrails,
-  eval) solid enough to defend live over adding unlisted features.
+- **Caching, follow-up questions, charts** — all in the brief's Optional list,
+  skipped per its own instruction that skipping costs nothing. Prioritized instead:
+  making the required core (schema inference on a genuinely unfamiliar file, async
+  jobs, guardrails, eval) solid enough to defend live over adding unlisted features.
+- **Cost tracking** — built, not skipped: every job's result and trace include real,
+  measured token usage per LLM call (see `docs/DESIGN.md` §4 for the actual numbers
+  and the three concrete ways the architecture keeps that usage down).
 - Two items from that Optional list — a semantic layer and LLM observability — were
   built anyway, because they directly reinforce required, heavily-weighted items
   (schema-context construction from an unfamiliar file, and being able to explain a

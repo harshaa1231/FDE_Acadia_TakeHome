@@ -10,6 +10,14 @@ class Settings(BaseSettings):
     fast_model: str = "openai/gpt-oss-20b"
     llm_request_timeout_s: float = 30.0
 
+    # Token usage is always tracked and reported per job (real, measured).
+    # A $/1k-token estimate is only computed if you set these to your
+    # actual negotiated rate for each model - left at 0 (unset) by
+    # default rather than guessing a price, since Groq's published rates
+    # change and differ by tier.
+    sql_model_cost_per_1k_tokens: float = 0.0
+    fast_model_cost_per_1k_tokens: float = 0.0
+
     # Data / query limits
     data_dir: str = "./data_store"
     max_upload_mb: int = 200

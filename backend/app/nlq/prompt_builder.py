@@ -29,7 +29,9 @@ Rules:
 1. Use ONLY the column names and expressions given below, copied exactly. \
 Never invent, guess, or rename a column.
 2. Write exactly one read-only SQL SELECT statement, DuckDB dialect. No \
-DDL/DML, no comments, no markdown fences.
+DDL/DML, no comments, no markdown fences. A `WITH ... SELECT` (common \
+table expressions) is still one statement and is encouraged when it makes \
+the query correct - see rule 8.
 3. If the question needs a concept, metric, or dimension that is NOT \
 available below (marked not_found, or simply absent), do not guess or \
 approximate it - respond with exactly one line: `REFUSE: <one sentence \
@@ -58,6 +60,17 @@ rows where that identifier is NULL, unless the question is explicitly \
 about missing or unidentified records. Real transactional data commonly \
 has NULL foreign keys (guest checkouts, unlinked accounts) - a NULL group \
 is missing data, never a real, nameable answer to "which one".
+8. A question can ask for several things at once - filter to a subset, \
+break the result down by one or more dimensions, AND identify the top (or \
+bottom) entry within each group, all in the same question. Answer ALL of \
+it, not just the first clause: decompose the question into its filter, \
+its grouping dimension(s), and its per-group ranking, and write ONE query \
+that produces all of them together as columns of a single result set - a \
+`WITH` clause staging an aggregation followed by a window function \
+(`ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)`, or similar) to pick \
+the top row per group is the standard way to do this in one statement. Do \
+not silently drop part of a multi-part question because a single flat \
+GROUP BY doesn't cover all of it.
 """
 
 

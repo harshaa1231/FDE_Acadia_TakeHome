@@ -8,8 +8,14 @@ Enforced, in order:
   2. That statement is a SELECT (or a UNION of SELECTs) - no DDL/DML, no
      PRAGMA/ATTACH/COPY/CALL (anything sqlglot can't classify as a known
      read-only construct is rejected by default, not allowed by default).
-  3. Every table referenced is the dataset's own table - never another
-     dataset's file, `information_schema`, or a `pragma_*` table.
+  3. Every table referenced is the dataset's own table, or a CTE (`WITH
+     x AS (...)`) defined earlier in the same query - never another
+     dataset's file, `information_schema`, or a `pragma_*` table. CTEs are
+     explicitly allowed: a compound question (filter, then break down by
+     one dimension, then find the top row per group) often needs a
+     window function staged through a CTE to answer in a single
+     statement, and that's still one read-only SELECT, not multiple
+     statements.
   4. Every column referenced is either a real column of that table or an
      alias defined earlier in the same query - never an invented name.
   5. A LIMIT is present, capped at MAX_RESULT_ROWS; one is injected if the
@@ -52,7 +58,8 @@ def validate_and_finalize_sql(sql: str, table_name: str, known_columns: set[str]
         raise SqlGuardrailError(f"only SELECT statements are allowed, got {type(root).__name__}")
 
     _reject_forbidden_nodes(root)
-    _validate_tables(root, table_name)
+    cte_names = _cte_names(root)
+    _validate_tables(root, table_name, cte_names)
     _validate_columns(root, known_columns)
 
     root = _ensure_limit(root, settings.max_result_rows)
@@ -73,11 +80,26 @@ def _reject_forbidden_nodes(root: exp.Expression) -> None:
             raise SqlGuardrailError(f"disallowed SQL construct: {type(node_obj).__name__}")
 
 
-def _validate_tables(root: exp.Expression, table_name: str) -> None:
+def _cte_names(root: exp.Expression) -> set[str]:
+    """Names introduced by a top-level WITH clause - these appear as
+    ordinary exp.Table nodes wherever they're referenced in a FROM/JOIN,
+    indistinguishable at that point from a real table reference, so they
+    must be collected first and treated as known-safe locals rather than
+    external tables."""
+    with_clause = root.args.get("with")
+    if not with_clause:
+        return set()
+    return {cte.alias.lower() for cte in with_clause.find_all(exp.CTE) if cte.alias}
+
+
+def _validate_tables(root: exp.Expression, table_name: str, cte_names: set[str]) -> None:
     for t in root.find_all(exp.Table):
         name = t.name
-        if name and name.lower() != table_name.lower():
-            raise SqlGuardrailError(f"query references unknown table '{name}'")
+        if not name:
+            continue
+        if name.lower() == table_name.lower() or name.lower() in cte_names:
+            continue
+        raise SqlGuardrailError(f"query references unknown table '{name}'")
 
 
 def _validate_columns(root: exp.Expression, known_columns: set[str]) -> None:

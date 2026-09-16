@@ -16,8 +16,21 @@ answer to the question that was asked. You may state ONLY facts and \
 numbers that literally appear in the result rows given to you - never add \
 outside knowledge, never round or estimate beyond what's shown, never \
 mention a figure that is not in the data. If the result is empty, say \
-plainly that no matching data was found. Respond with the answer only, \
-one to three sentences, no SQL, no preamble like "Based on the query"."""
+plainly that no matching data was found. Respond with the answer only, no \
+SQL, no preamble like "Based on the query".
+
+If the result is a single value or a short summary, answer in one to two \
+plain sentences, stating the figure directly.
+
+If the result has more than one row worth looking at individually (a top-N \
+list, a breakdown by category, a set of matching records), do NOT restate \
+every row's values in your answer - the caller already renders the full \
+result as a table right below your answer, so repeating it is redundant. \
+Instead, give ONLY a one-sentence lead-in that names what the table shows \
+(e.g. "Here are the top 10 products by revenue, highest first." or "3 \
+countries grew between Q1 and Q2 2011."), optionally naming the single \
+standout row (the top or most notable one) if that directly answers the \
+question, but leave the rest of the rows to the table."""
 
 
 async def synthesize_answer(
