@@ -362,13 +362,23 @@ def _validate_line_amount(
     # Sanctioned exception to "no column serves two roles": line_amount may
     # legitimately be the exact same column as unit_amount when there's no
     # separate quantity concept (a single "fare_amount" both prices and
-    # totals the row - quantity=1 is implicit). Every other duplicate claim
-    # is still rejected below.
+    # totals the row - quantity=1 is implicit). This only holds if quantity
+    # genuinely wasn't resolved - if the LLM's own response ALSO resolved a
+    # quantity role, that contradicts "qty=1 implicit": unit_amount is then
+    # clearly a per-unit price, and the aliasing shortcut would silently
+    # drop the quantity multiplication (found live: a dataset with both a
+    # real quantity column and this proposal produced net revenue off by
+    # the average quantity per line - about half the correct figure, not a
+    # rounding error). Every other duplicate claim is still rejected below.
     unit_role = roles.get("unit_amount")
-    if (
+    quantity_role = roles.get("quantity")
+    quantity_resolved = quantity_role is not None and quantity_role.source != "not_found"
+    proposes_same_as_unit_amount = bool(
         proposal.column and unit_role and unit_role.source == "direct_column"
         and unit_role.expression == f'"{proposal.column}"'
-    ):
+    )
+
+    if proposes_same_as_unit_amount and not quantity_resolved:
         expression, applied = _compose_adjustments(unit_role.expression, roles)
         note = "same column as unit_amount, treated as the line total (no separate quantity concept)"
         if applied:
@@ -386,7 +396,16 @@ def _validate_line_amount(
     if direct.source == "direct_column":
         return direct
 
-    if proposal.derive_from_quantity_and_unit_amount and roles.get("quantity") and roles.get("unit_amount"):
+    # Derive from quantity * unit_amount either because the LLM asked for
+    # it explicitly, or because it proposed the aliasing shortcut above but
+    # a genuine quantity role also exists - in that contradiction the
+    # quantity role (independently, structurally validated on its own) is
+    # the more reliable signal, so prefer multiplying over silently
+    # dropping it.
+    wants_derivation = proposal.derive_from_quantity_and_unit_amount or (
+        proposes_same_as_unit_amount and quantity_resolved
+    )
+    if wants_derivation and roles.get("quantity") and roles.get("unit_amount"):
         qty, unit = roles["quantity"], roles["unit_amount"]
         if qty.source != "not_found" and unit.source != "not_found":
             expression, applied = _compose_adjustments(f"{qty.expression} * {unit.expression}", roles)

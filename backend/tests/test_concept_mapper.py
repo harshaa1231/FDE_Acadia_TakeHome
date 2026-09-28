@@ -554,6 +554,45 @@ async def test_line_amount_aliases_unit_amount_unchanged_without_adjustments():
 
 
 @pytest.mark.asyncio
+async def test_aliasing_shortcut_declined_when_a_real_quantity_role_also_resolved():
+    """Reproduces a real bug found live: the LLM's own response resolved a
+    genuine quantity role (units_sold) AND separately proposed line_amount
+    as the exact same column as unit_amount - the "no separate quantity
+    concept" precondition the aliasing shortcut depends on was never
+    actually checked, so it fired anyway and silently dropped the quantity
+    multiplication, undercounting net revenue by roughly the average
+    quantity per line. Since quantity was independently, structurally
+    resolved as its own role, the correct behavior is to derive
+    quantity * unit_amount instead of taking the contradictory shortcut."""
+    columns = RIDESHARE_COLUMNS + [col("units_sold", "integer", 5, 3000, min_value=1, max_value=5)]
+    llm = FakeLLMClient(
+        {
+            "quantity": role("units_sold"),
+            "unit_amount": role("fare_amount"),
+            "line_amount": role("fare_amount"),  # same column as unit_amount - contradicts quantity above
+        }
+    )
+    p = profile(columns, 3000)
+    cmap = await build_concept_map(p, llm, model="fake")
+    line = cmap.get("line_amount")
+    assert line.source == "derived_expression"
+    assert line.expression == '("units_sold" * "fare_amount")'
+
+
+@pytest.mark.asyncio
+async def test_aliasing_shortcut_still_applies_when_quantity_genuinely_absent():
+    """Sanity check that the fix didn't overcorrect: when quantity truly
+    isn't resolved, the aliasing shortcut must still fire exactly as
+    before (qty=1 implicit is the correct interpretation there)."""
+    llm = FakeLLMClient({"unit_amount": role("fare_amount"), "line_amount": role("fare_amount")})
+    p = profile(RIDESHARE_COLUMNS, 3000)
+    cmap = await build_concept_map(p, llm, model="fake")
+    line = cmap.get("line_amount")
+    assert line.source == "direct_column"
+    assert line.expression == '"fare_amount"'
+
+
+@pytest.mark.asyncio
 async def test_unmapped_columns_never_dropped():
     llm = FakeLLMClient({"event_group_id": role("trip_ref"), "unit_amount": role("fare_amount")})
     p = profile(RIDESHARE_COLUMNS, 3000)
