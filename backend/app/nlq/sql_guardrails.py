@@ -8,9 +8,19 @@ Enforced, in order:
   2. That statement is a SELECT (or a UNION of SELECTs) - no DDL/DML, no
      PRAGMA/ATTACH/COPY/CALL (anything sqlglot can't classify as a known
      read-only construct is rejected by default, not allowed by default).
-  3. Every table referenced is the dataset's own table, or a CTE (`WITH
-     x AS (...)`) defined earlier in the same query - never another
-     dataset's file, `information_schema`, or a `pragma_*` table. CTEs are
+  3. Every table position is either the dataset's own table, a CTE (`WITH
+     x AS (...)`) defined earlier in the same query, or is rejected
+     outright if it isn't a plain name at all. That last part matters:
+     `FROM read_csv('/etc/passwd')`, `read_csv_auto(...)`,
+     `read_parquet(...)` and any other DuckDB table function are still
+     syntactically a SELECT, and instead of resolving to a named table
+     they parse as a function call sitting in table position - sqlglot
+     gives that node an empty `.name`, so a name-only check silently
+     lets it through. The fix isn't a blacklist of function names (the
+     next one DuckDB ships would sail right past a list); it's
+     structural - a legitimate table position is always a plain
+     identifier, so anything else in that position is rejected
+     regardless of what it's called. See _validate_tables. CTEs are
      explicitly allowed: a compound question (filter, then break down by
      one dimension, then find the top row per group) often needs a
      window function staged through a CTE to answer in a single
@@ -92,8 +102,34 @@ def _cte_names(root: exp.Expression) -> set[str]:
     return {cte.alias.lower() for cte in with_clause.find_all(exp.CTE) if cte.alias}
 
 
+def _table_function_name(node: exp.Expression) -> str:
+    """Best-effort readable name for an error message - never used for the
+    security decision itself, only to explain it. Dedicated function
+    classes (ReadCSV, GenerateSeries, ...) know their own SQL name;
+    sqlglot falls back to exp.Anonymous for any function it doesn't have
+    a dedicated class for, which carries the literal name as `.this`."""
+    if isinstance(node, exp.Anonymous):
+        return str(node.this)
+    if isinstance(node, exp.Func) and hasattr(node, "sql_name"):
+        return node.sql_name()
+    return type(node).__name__
+
+
 def _validate_tables(root: exp.Expression, table_name: str, cte_names: set[str]) -> None:
     for t in root.find_all(exp.Table):
+        # A legitimate table position is always a plain name (the
+        # dataset's own table, or a CTE alias) - anything else sitting in
+        # table position is a function call DuckDB will execute, which is
+        # exactly how read_csv()/read_csv_auto()/read_parquet()/etc. reach
+        # arbitrary files: syntactically still "just a SELECT", but not a
+        # reference to any table this app registered. Reject the shape,
+        # not a list of names, so a DuckDB table function this list has
+        # never heard of is rejected the same way.
+        if not isinstance(t.this, exp.Identifier):
+            raise SqlGuardrailError(
+                f"query uses a disallowed table function '{_table_function_name(t.this)}' - "
+                "only the dataset's own table and CTEs defined in the query are allowed"
+            )
         name = t.name
         if not name:
             continue

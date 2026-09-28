@@ -124,7 +124,7 @@ auto-generated OpenAPI UI).
 ```bash
 cd backend
 source .venv/bin/activate
-pytest                 # 74 tests, deterministic, no network calls, ~1s
+pytest                 # 86 tests, deterministic, no network calls, ~1s
 ruff check app tests   # lint
 ```
 

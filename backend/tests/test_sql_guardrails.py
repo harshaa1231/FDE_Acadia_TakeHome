@@ -119,3 +119,88 @@ def test_cte_referencing_undefined_alias_is_rejected():
     """
     with pytest.raises(SqlGuardrailError, match="unknown table"):
         validate_and_finalize_sql(sql, TABLE, COLUMNS)
+
+
+# --- Table-valued functions / arbitrary external resource access ---
+#
+# SELECT * FROM read_csv('/etc/passwd') is still syntactically "just a
+# SELECT" - single statement, no DDL/DML, LIMIT-able - but DuckDB's table
+# functions let it read any file/path/URL the DuckDB process can reach,
+# completely outside the uploaded dataset. sqlglot gives a table-function
+# call an empty `.name` (the real content lives in `.this` as a function
+# node, not a plain identifier), so a name-only check silently lets it
+# through. These are structural tests: they never mention "read_csv" in
+# the guardrail's own code, only in these test inputs, so a DuckDB table
+# function that doesn't exist yet is covered the same way.
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM read_csv('/etc/passwd')",
+        "SELECT * FROM read_csv('/etc/passwd', header=true)",
+        "SELECT * FROM read_csv_auto('/etc/passwd')",
+        "SELECT * FROM read_parquet('s3://some-bucket/data.parquet')",
+        "SELECT * FROM read_json('/etc/passwd')",
+        "SELECT * FROM read_json_auto('/etc/passwd')",
+        "SELECT * FROM read_ndjson('/etc/passwd')",
+        "SELECT * FROM glob('/etc/*')",
+    ],
+)
+def test_rejects_table_valued_functions(sql):
+    with pytest.raises(SqlGuardrailError, match="disallowed table function"):
+        validate_and_finalize_sql(sql, TABLE, COLUMNS)
+
+
+def test_rejects_table_function_joined_alongside_the_real_table():
+    """The attack doesn't need to replace the FROM clause - smuggling a
+    table function into a JOIN alongside the legitimate table is just as
+    dangerous, and must be caught the same way."""
+    sql = f"SELECT t.* FROM {TABLE} AS t, read_csv('/etc/passwd') AS leak"
+    with pytest.raises(SqlGuardrailError, match="disallowed table function"):
+        validate_and_finalize_sql(sql, TABLE, COLUMNS)
+
+
+def test_rejects_table_function_hidden_inside_a_cte():
+    """The CTE allowance (needed for compound questions) must not become a
+    second way to smuggle a table function past the check - the function
+    call is still there, just one level down."""
+    sql = """
+    WITH leaked AS (SELECT * FROM read_csv('/etc/passwd'))
+    SELECT * FROM leaked
+    """
+    with pytest.raises(SqlGuardrailError, match="disallowed table function"):
+        validate_and_finalize_sql(sql, TABLE, COLUMNS)
+
+
+def test_rejects_table_function_inside_a_union_branch():
+    """A UNION is explicitly an allowed root shape - a table function
+    hiding in the second branch must still be caught."""
+    sql = f"SELECT \"country\" FROM {TABLE} UNION SELECT * FROM read_csv('/etc/passwd')"
+    with pytest.raises(SqlGuardrailError, match="disallowed table function"):
+        validate_and_finalize_sql(sql, TABLE, COLUMNS)
+
+
+def test_legitimate_queries_are_unaffected_by_the_table_function_check():
+    """The fix must not cost anything for real usage: a plain query, a
+    filtered aggregation, and a multi-CTE compound query (the exact shape
+    the CTE allowance exists for) all still work."""
+    sql1 = validate_and_finalize_sql(f'SELECT * FROM {TABLE}', TABLE, COLUMNS)
+    assert 'FROM "transactions"' in sql1 or "FROM transactions" in sql1
+
+    sql2 = validate_and_finalize_sql(
+        f'SELECT "country", SUM("line_revenue") AS revenue FROM {TABLE} '
+        f'WHERE "description" ILIKE \'%CHRISTMAS%\' GROUP BY "country"',
+        TABLE, COLUMNS,
+    )
+    assert "revenue" in sql2
+
+    sql3 = validate_and_finalize_sql(
+        f"""
+        WITH filtered AS (SELECT "country", "line_revenue" FROM {TABLE}),
+        agg AS (SELECT "country", SUM("line_revenue") AS total FROM filtered GROUP BY "country")
+        SELECT * FROM agg ORDER BY total DESC
+        """,
+        TABLE, COLUMNS,
+    )
+    assert "agg" in sql3
