@@ -114,10 +114,18 @@ def load_csv(dataset_id: str, csv_path: str) -> IngestResult:
 
 
 def open_dataset(dataset_id: str) -> duckdb.DuckDBPyConnection:
+    """Opens an already-ingested dataset for profiling and question
+    execution - never for loading a new file, so unlike `load_csv` above
+    this connection has no legitimate reason to ever touch anything
+    outside its own DuckDB file. Disabling external access here is a
+    second, independent layer behind sql_guardrails: even if a future
+    guardrail gap let a table-function call through the AST check, DuckDB
+    itself would still refuse to execute it - the two don't share a
+    single point of failure."""
     db_path = dataset_db_path(dataset_id)
     if not db_path.exists():
         raise FileNotFoundError(f"No dataset store for '{dataset_id}'")
-    return duckdb.connect(str(db_path), read_only=False)
+    return duckdb.connect(str(db_path), read_only=False, config={"enable_external_access": False})
 
 
 def drop_dataset(dataset_id: str) -> None:
